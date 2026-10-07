@@ -68,6 +68,16 @@ class SequenceAuditUnsupportedError(APIError):
     code = "SEQUENCE_AUDIT_UNSUPPORTED"
 
 
+class SessionCheckpointInvalidError(APIError):
+    status_code = 422
+    code = "SESSION_IMPORT_INVALID"
+
+
+class SessionImportConflictError(APIError):
+    status_code = 409
+    code = "SESSION_IMPORT_CONFLICT"
+
+
 class FieldOutOfBoundsError(DecodeError):
     code = "FIELD_OUT_OF_BOUNDS"
 

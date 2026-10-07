@@ -6,6 +6,7 @@ import hashlib
 import json
 import threading
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import FastAPI, Request
@@ -22,6 +23,7 @@ from .audit import (
     audit_frames,
     sequence_bit_width,
 )
+from .checkpoint import validate_checkpoint
 from .config import Settings, get_settings
 from .db import Database
 from .decoder import decode_stream
@@ -34,9 +36,12 @@ from .errors import (
     ProtocolVersionConflictError,
     SequenceAuditUnsupportedError,
     SessionAppendConflictError,
+    SessionCheckpointInvalidError,
+    SessionImportConflictError,
     SessionNotFoundError,
 )
 from .models import (
+    CHECKPOINT_FORMAT_VERSION,
     CreateSessionRequest,
     DecodeRequest,
     DecodeResponse,
@@ -45,6 +50,7 @@ from .models import (
     ProtocolDefinition,
     SessionAppendRequest,
     SessionAppendResponse,
+    SessionCheckpoint,
     SessionProgressResponse,
 )
 
@@ -582,8 +588,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         row = db.get_session(session_id)
         if row is None:
             raise SessionNotFoundError(message=f"session '{session_id}' not found")
-        tail_bytes = base64.b64decode(row["tail_b64"]) if row["tail_b64"] else b""
-        tail_start = row["received_offset"] - len(tail_bytes)
+        return _progress_from_row(row)
+
+    # ---- session checkpoint export / import (SQLite migration) ------------
+
+    @app.get(
+        "/sessions/{session_id}/checkpoint",
+        response_model=SessionCheckpoint,
+    )
+    async def export_session_checkpoint(session_id: str) -> dict:
+        """Export one committed session state for replay on another database.
+
+        The session row and its protocol definition digest are read in one
+        joined statement — a single snapshot of one committed point — so the
+        protocol version/digest, received offset, pending tail, cumulative
+        frames, last fragment digest, original response and audit progress
+        always describe the same committed state.
+        """
+        db: Database = app.state.db
+        row = db.get_session_export(session_id)
+        if row is None:
+            raise SessionNotFoundError(message=f"session '{session_id}' not found")
+
         audit = None
         if row["audit_enabled"]:
             audit = {
@@ -595,26 +621,146 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "indeterminates": row["audit_indeterminates"],
                 "missing_total": row["audit_missing_total"],
             }
+
+        last_response = json.loads(row["last_response"]) if row["last_response"] else None
         return {
-            "session_id": session_id,
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "session_id": row["session_id"],
             "protocol_id": row["protocol_id"],
             "version": row["version"],
+            "definition_sha256": row["protocol_definition_sha256"],
             "received_offset": row["received_offset"],
-            "next_offset": row["received_offset"],
-            "tail": {
-                "start": tail_start,
-                "end": row["received_offset"],
-                "payload_b64": row["tail_b64"],
-            },
+            "tail_b64": row["tail_b64"],
             "frames_total": row["frames_total"],
             "last_chunk_offset": row["last_chunk_offset"],
             "last_chunk_sha256": row["last_chunk_sha256"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
+            "last_response": last_response,
+            "audit_enabled": bool(row["audit_enabled"]),
             "sequence_audit": audit,
         }
 
+    @app.post(
+        "/sessions/import",
+        response_model=SessionProgressResponse,
+        status_code=201,
+    )
+    async def import_session_checkpoint(request: Request) -> dict:
+        """Import a checkpointed session so it continues under its original id.
+
+        Only accepted when the target database has the exact protocol version
+        registered with an identical definition digest, no session with the
+        checkpoint id exists yet, and the checkpoint is internally consistent
+        (tail/offset and the stored original response self-consistent). On
+        success every state element lands in one row/transaction; on any
+        failure the target database is left completely untouched.
+        """
+        try:
+            raw = json.loads(await request.body())
+        except Exception as exc:  # JSONDecodeError etc.
+            raise InvalidBase64Error(
+                code="INVALID_JSON", message=f"request body must be valid JSON: {exc}"
+            ) from exc
+
+        checkpoint, _ = validate_checkpoint(raw)
+
+        db: Database = app.state.db
+        # Serialise same-process imports of the same id against concurrent
+        # appends/imports; cross-process safety is the atomic import txn.
+        with _session_lock(checkpoint.session_id):
+            audit = checkpoint.sequence_audit
+            result = db.import_session_checkpoint(
+                session_id=checkpoint.session_id,
+                protocol_id=checkpoint.protocol_id,
+                version=checkpoint.version,
+                definition_sha=checkpoint.definition_sha256,
+                received_offset=checkpoint.received_offset,
+                tail_b64=checkpoint.tail_b64,
+                frames_total=checkpoint.frames_total,
+                last_chunk_offset=checkpoint.last_chunk_offset,
+                last_chunk_sha=checkpoint.last_chunk_sha256,
+                # Persist the exact validated response so an identical resend
+                # of the last fragment replays it verbatim.
+                last_response_json=(
+                    checkpoint.last_response.model_dump_json()
+                    if checkpoint.last_response is not None
+                    else ""
+                ),
+                audit_enabled=checkpoint.audit_enabled,
+                audit_bit_width=audit.bit_width if audit is not None else None,
+                audit_last_sequence=audit.last_sequence if audit is not None else None,
+                audit_duplicates=audit.duplicates if audit is not None else 0,
+                audit_suspected_gaps=audit.suspected_gaps if audit is not None else 0,
+                audit_backwards=audit.backwards if audit is not None else 0,
+                audit_indeterminates=audit.indeterminates if audit is not None else 0,
+                audit_missing_total=audit.missing_total if audit is not None else 0,
+            )
+
+            if result == "protocol_mismatch":
+                raise SessionCheckpointInvalidError(
+                    message=(
+                        f"protocol '{checkpoint.protocol_id}' version "
+                        f"{checkpoint.version} is not registered in the target "
+                        "database with the checkpoint's exact definition digest"
+                    ),
+                    details={
+                        "reason": "protocol_mismatch",
+                        "protocol_id": checkpoint.protocol_id,
+                        "version": checkpoint.version,
+                        "definition_sha256": checkpoint.definition_sha256,
+                    },
+                )
+            if result == "session_exists":
+                raise SessionImportConflictError(
+                    message=(
+                        f"session '{checkpoint.session_id}' already exists in the "
+                        "target database; existing state is not overwritten"
+                    ),
+                    details={
+                        "reason": "session_exists",
+                        "session_id": checkpoint.session_id,
+                    },
+                )
+
+            row = db.get_session(checkpoint.session_id)
+            return _progress_from_row(row)
+
     return app
+
+
+def _progress_from_row(row: dict) -> dict:
+    """Build the session progress response body from one durable session row."""
+    tail_bytes = base64.b64decode(row["tail_b64"]) if row["tail_b64"] else b""
+    tail_start = row["received_offset"] - len(tail_bytes)
+    audit = None
+    if row["audit_enabled"]:
+        audit = {
+            "bit_width": row["audit_bit_width"],
+            "last_sequence": row["audit_last_sequence"],
+            "duplicates": row["audit_duplicates"],
+            "suspected_gaps": row["audit_suspected_gaps"],
+            "backwards": row["audit_backwards"],
+            "indeterminates": row["audit_indeterminates"],
+            "missing_total": row["audit_missing_total"],
+        }
+    return {
+        "session_id": row["session_id"],
+        "protocol_id": row["protocol_id"],
+        "version": row["version"],
+        "received_offset": row["received_offset"],
+        "next_offset": row["received_offset"],
+        "tail": {
+            "start": tail_start,
+            "end": row["received_offset"],
+            "payload_b64": row["tail_b64"],
+        },
+        "frames_total": row["frames_total"],
+        "last_chunk_offset": row["last_chunk_offset"],
+        "last_chunk_sha256": row["last_chunk_sha256"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "sequence_audit": audit,
+    }
 
 
 app = create_app()

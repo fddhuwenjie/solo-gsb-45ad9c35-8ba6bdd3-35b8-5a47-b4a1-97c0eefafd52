@@ -386,6 +386,119 @@ class Database:
         session["audit_missing_total"] = _decode_wide(session["audit_missing_total"])
         return session
 
+    def get_session_export(self, session_id: str) -> dict[str, Any] | None:
+        """Read one session plus its protocol definition digest atomically.
+
+        The single joined SELECT is one statement, hence one snapshot: all
+        session columns and the protocol's ``definition_sha256`` come from the
+        same committed point in time, so an exported checkpoint can never mix
+        an append state with a different commit's protocol metadata. Wide
+        audit values are decoded to exact Python ints like get_session().
+        """
+        cur = self.conn.execute(
+            "SELECT s.*, p.definition_sha256 AS protocol_definition_sha256 "
+            "FROM sessions AS s "
+            "JOIN protocols AS p "
+            "  ON p.protocol_id = s.protocol_id AND p.version = s.version "
+            "WHERE s.session_id = ?",
+            (session_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        session = dict(row)
+        session["audit_last_sequence"] = _decode_wide(session["audit_last_sequence"])
+        session["audit_missing_total"] = _decode_wide(session["audit_missing_total"])
+        return session
+
+    def import_session_checkpoint(
+        self,
+        *,
+        session_id: str,
+        protocol_id: str,
+        version: int,
+        definition_sha: str,
+        received_offset: int,
+        tail_b64: str,
+        frames_total: int,
+        last_chunk_offset: int | None,
+        last_chunk_sha: str | None,
+        last_response_json: str,
+        audit_enabled: bool,
+        audit_bit_width: int | None,
+        audit_last_sequence: int | None,
+        audit_duplicates: int,
+        audit_suspected_gaps: int,
+        audit_backwards: int,
+        audit_indeterminates: int,
+        audit_missing_total: int,
+    ) -> str:
+        """Insert an imported session state in one atomic transaction.
+
+        All state (offset, tail, frame total, last fragment, original
+        response, audit progress) lands as a single row, so an import is
+        either fully applied or not applied at all. Returns one of:
+
+        * ``"imported"``  — the row was inserted;
+        * ``"session_exists"`` — a session with this id already exists, the
+          target state is left untouched (no overwrite);
+        * ``"protocol_mismatch"`` — the exact protocol version is not
+          registered with the given definition digest, nothing was written.
+
+        The checks run inside the same write transaction as the INSERT,
+        closing the time-of-check/time-of-use window against a concurrent
+        registration or a competing import on another process.
+        """
+        conn = self.conn
+        with conn:
+            prow = conn.execute(
+                "SELECT definition_sha256 FROM protocols "
+                "WHERE protocol_id = ? AND version = ?",
+                (protocol_id, version),
+            ).fetchone()
+            if prow is None or prow["definition_sha256"] != definition_sha:
+                return "protocol_mismatch"
+            existing = conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if existing is not None:
+                return "session_exists"
+            try:
+                conn.execute(
+                    "INSERT INTO sessions "
+                    "(session_id, protocol_id, version, received_offset, tail_b64, "
+                    " frames_total, last_chunk_offset, last_chunk_sha256, last_response, "
+                    " audit_enabled, audit_bit_width, audit_last_sequence, "
+                    " audit_duplicates, audit_suspected_gaps, audit_backwards, "
+                    " audit_indeterminates, audit_missing_total) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        protocol_id,
+                        version,
+                        received_offset,
+                        tail_b64,
+                        frames_total,
+                        last_chunk_offset,
+                        last_chunk_sha,
+                        last_response_json,
+                        int(audit_enabled),
+                        audit_bit_width,
+                        _encode_wide(audit_last_sequence),
+                        audit_duplicates,
+                        audit_suspected_gaps,
+                        audit_backwards,
+                        audit_indeterminates,
+                        _encode_wide(audit_missing_total),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # Another process sharing this database file inserted the
+                # same session_id between the existence check and the INSERT;
+                # the enclosing transaction rolls back and nothing is written.
+                return "session_exists"
+        return "imported"
+
     def save_session_append(
         self,
         session_id: str,

@@ -462,3 +462,65 @@ class SessionProgressResponse(BaseModel):
         description="Cumulative sequence audit state; null unless the session "
         "was created with sequence_audit enabled",
     )
+
+
+# ---------------------------------------------------------------------------
+# Session checkpoints: portable export/import when swapping SQLite files
+# ---------------------------------------------------------------------------
+
+
+CHECKPOINT_FORMAT_VERSION = 1
+
+
+class CheckpointAuditState(BaseModel):
+    """Sequence audit progress carried by a session checkpoint.
+
+    ``last_sequence`` / ``missing_total`` are arbitrary-precision ints on
+    purpose: they may exceed SQLite's signed 64-bit INTEGER range and must
+    survive the export/import round trip digit for digit.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    bit_width: int = Field(..., ge=2, le=64)
+    last_sequence: int | None
+    duplicates: int = Field(..., ge=0)
+    suspected_gaps: int = Field(..., ge=0)
+    backwards: int = Field(..., ge=0)
+    indeterminates: int = Field(..., ge=0)
+    missing_total: int = Field(..., ge=0)
+
+
+class SessionCheckpoint(BaseModel):
+    """One committed session state, portable between SQLite databases.
+
+    Every field comes from the same committed snapshot (one joined read), so
+    import can reproduce the session exactly: protocol version plus its
+    definition digest, received offset, raw pending tail, cumulative frame
+    count, the most recent fragment digest and its original response, and the
+    sequence-audit progress when enabled.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    format_version: int = Field(
+        CHECKPOINT_FORMAT_VERSION,
+        description="Checkpoint envelope format version; only exactly supported versions import",
+    )
+    exported_at: str = Field(..., description="UTC ISO-8601 timestamp of the export")
+    session_id: str
+    protocol_id: str
+    version: int = Field(..., ge=1)
+    definition_sha256: str
+    received_offset: int = Field(..., ge=0)
+    tail_b64: str
+    frames_total: int = Field(..., ge=0)
+    last_chunk_offset: int | None = Field(None, ge=0)
+    last_chunk_sha256: str | None = None
+    last_response: SessionAppendResponse | None = Field(
+        None,
+        description="Original response of the most recent committed append; "
+        "its identical resend must replay this verbatim",
+    )
+    audit_enabled: bool
+    sequence_audit: CheckpointAuditState | None = None
