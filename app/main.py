@@ -22,6 +22,7 @@ from .audit import (
     audit_frames,
     sequence_bit_width,
 )
+from .checkpoint import checkpoint_from_row, validate_checkpoint
 from .config import Settings, get_settings
 from .db import Database
 from .decoder import decode_stream
@@ -34,6 +35,7 @@ from .errors import (
     ProtocolVersionConflictError,
     SequenceAuditUnsupportedError,
     SessionAppendConflictError,
+    SessionCheckpointConflictError,
     SessionNotFoundError,
 )
 from .models import (
@@ -45,6 +47,7 @@ from .models import (
     ProtocolDefinition,
     SessionAppendRequest,
     SessionAppendResponse,
+    SessionCheckpoint,
     SessionProgressResponse,
 )
 
@@ -576,12 +579,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             return response
 
-    @app.get("/sessions/{session_id}", response_model=SessionProgressResponse)
-    async def session_progress(session_id: str) -> dict:
-        db: Database = app.state.db
-        row = db.get_session(session_id)
-        if row is None:
-            raise SessionNotFoundError(message=f"session '{session_id}' not found")
+    def _session_progress_body(row: dict) -> dict:
         tail_bytes = base64.b64decode(row["tail_b64"]) if row["tail_b64"] else b""
         tail_start = row["received_offset"] - len(tail_bytes)
         audit = None
@@ -596,7 +594,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "missing_total": row["audit_missing_total"],
             }
         return {
-            "session_id": session_id,
+            "session_id": row["session_id"],
             "protocol_id": row["protocol_id"],
             "version": row["version"],
             "received_offset": row["received_offset"],
@@ -613,6 +611,122 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "updated_at": row["updated_at"],
             "sequence_audit": audit,
         }
+
+    @app.get("/sessions/{session_id}", response_model=SessionProgressResponse)
+    async def session_progress(session_id: str) -> dict:
+        row = app.state.db.get_session(session_id)
+        if row is None:
+            raise SessionNotFoundError(message=f"session '{session_id}' not found")
+        return _session_progress_body(row)
+
+    # ---- session checkpoints (database-to-database migration) -------------
+
+    @app.get("/sessions/{session_id}/checkpoint", response_model=SessionCheckpoint)
+    async def export_session_checkpoint(session_id: str) -> dict:
+        db: Database = app.state.db
+        # Session columns and the pinned protocol's definition digest are
+        # read in one SELECT, so the checkpoint captures a single committed
+        # moment even while appends continue on this database.
+        row = db.get_session_checkpoint(session_id)
+        if row is None:
+            if db.get_session(session_id) is None:
+                raise SessionNotFoundError(
+                    message=f"session '{session_id}' not found"
+                )
+            # Protocol rows are never deleted, so a session without its
+            # pinned protocol version should not occur.
+            raise ProtocolNotFoundError(  # pragma: no cover
+                message=f"pinned protocol of session '{session_id}' not found"
+            )
+        return checkpoint_from_row(row)
+
+    @app.post("/sessions/checkpoint", status_code=201, response_model=SessionProgressResponse)
+    async def import_session_checkpoint(checkpoint: SessionCheckpoint) -> dict:
+        db: Database = app.state.db
+
+        # The target database must already register the exact pinned protocol
+        # version with the identical definition digest.
+        proto_row = db.get_protocol_row(checkpoint.protocol_id, checkpoint.version)
+        if proto_row is None:
+            raise ProtocolNotFoundError(
+                message=(
+                    f"protocol '{checkpoint.protocol_id}' version "
+                    f"{checkpoint.version} not found"
+                )
+            )
+        if proto_row["definition_sha256"] != checkpoint.definition_sha256:
+            raise SessionCheckpointConflictError(
+                message=(
+                    f"protocol '{checkpoint.protocol_id}' version "
+                    f"{checkpoint.version} is registered with a different "
+                    "definition in this database"
+                ),
+                details={
+                    "reason": "protocol_mismatch",
+                    "protocol_id": checkpoint.protocol_id,
+                    "version": checkpoint.version,
+                    "registered_sha256": proto_row["definition_sha256"],
+                    "checkpoint_sha256": checkpoint.definition_sha256,
+                },
+            )
+
+        if db.get_session(checkpoint.session_id) is not None:
+            raise SessionCheckpointConflictError(
+                message=(
+                    f"session '{checkpoint.session_id}' already exists in "
+                    "this database"
+                ),
+                details={
+                    "reason": "session_exists",
+                    "session_id": checkpoint.session_id,
+                },
+            )
+
+        proto = Database.row_to_protocol(proto_row)
+        # Tail, offsets, the stored last response and the audit block must be
+        # mutually consistent before anything is written.
+        validate_checkpoint(checkpoint, proto)
+
+        audit = checkpoint.sequence_audit
+        inserted = db.insert_session_checkpoint(
+            checkpoint.session_id,
+            checkpoint.protocol_id,
+            checkpoint.version,
+            received_offset=checkpoint.received_offset,
+            tail_b64=checkpoint.tail_b64,
+            frames_total=checkpoint.frames_total,
+            last_chunk_offset=checkpoint.last_chunk_offset,
+            last_chunk_sha256=checkpoint.last_chunk_sha256,
+            # Stored exactly as an append commit would store it, so a resend
+            # of the last chunk replays the original response verbatim.
+            last_response_json=(
+                checkpoint.last_response.model_dump_json()
+                if checkpoint.last_response is not None
+                else ""
+            ),
+            audit_enabled=audit is not None,
+            audit_bit_width=audit.bit_width if audit is not None else None,
+            audit_last_sequence=audit.last_sequence if audit is not None else None,
+            audit_duplicates=audit.duplicates if audit is not None else 0,
+            audit_suspected_gaps=audit.suspected_gaps if audit is not None else 0,
+            audit_backwards=audit.backwards if audit is not None else 0,
+            audit_indeterminates=audit.indeterminates if audit is not None else 0,
+            audit_missing_total=audit.missing_total if audit is not None else 0,
+        )
+        if not inserted:
+            # A concurrent import (or session creation) won the race for
+            # this session_id; the existing state is left untouched.
+            raise SessionCheckpointConflictError(
+                message=(
+                    f"session '{checkpoint.session_id}' already exists in "
+                    "this database"
+                ),
+                details={
+                    "reason": "session_exists",
+                    "session_id": checkpoint.session_id,
+                },
+            )
+        return _session_progress_body(db.get_session(checkpoint.session_id))
 
     return app
 

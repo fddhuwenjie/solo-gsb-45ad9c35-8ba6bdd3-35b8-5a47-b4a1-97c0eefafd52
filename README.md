@@ -33,6 +33,13 @@
   最近序号与累计缺失数按**十进制文本**无损落库——u64 原始序号达到 2⁶³、累计推断缺失数超出
   SQLite 有符号 64 位 INTEGER 上限时追加依然成功且数值逐位精确；旧库文件在启动时**就地透明
   迁移**（审计列由 INTEGER 重建为 TEXT，历史值原样保留），既有会话照常读取（边界示例见 4.7.4）。
+- **会话检查点导出 / 导入** `GET /sessions/{id}/checkpoint` + `POST /sessions/checkpoint`：更换
+  SQLite 数据库时，把会话在**同一已提交时刻**的完整状态（协议确切版本与定义摘要、接收偏移、原始
+  待决尾部、累计帧数、最近分片摘要与原响应、启用时的稽核进度）导出为 JSON，并导入到**已注册相同
+  定义摘要的确切协议版本**的目标库——尾部、偏移与最近响应自洽校验通过后一次落库。目标库已有同名
+  会话、协议不匹配或检查点无效时整次失败且不覆盖现有状态；导入后按原 `session_id` 续采，跨分片
+  解码与稽核接续，最近分片重发仍返回原响应而不重复计数，超出 SQLite 有符号整数范围的稽核值保持
+  精确（见 4.8）。
 - **丢弃区间审计**：每次跳过都返回 `[start, end)` 区间与各候选的失败原因
   （`length_out_of_bounds` / `crc_failed` / `malformed_escape`）。
 - **结果复用**：同一协议版本 + 输入字节 SHA-256 摘要命中 SQLite 缓存，响应中
@@ -741,6 +748,160 @@ curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/jso
 超出有符号 64 位仍逐位精确；`GET /sessions/{id}` 返回同样的精确值，同分片重试重放、失败不推进、
 重启续判与多实例共用数据库后的比较基准均不受影响（对应 `tests/test_sequence_audit_wide.py`）。
 
+#### 4.8 会话检查点导出 / 导入（更换 SQLite 数据库）
+
+更换 SQLite 数据库文件（新命名卷、新实例、新环境）时，不必丢弃进行中的采集会话：
+`GET /sessions/{id}/checkpoint` 把会话在**同一已提交时刻**的完整状态导出为 JSON 检查点，
+`POST /sessions/checkpoint` 把它导入另一个数据库，会话按**原 `session_id`** 在目标库续采。
+
+检查点包含：协议确切版本与定义摘要（`definition_sha256`）、接收偏移、原始待决尾部
+（`tail_b64`）、累计帧数、最近分片（偏移 + SHA-256 + 原响应）以及启用稽核时的稽核进度。
+导出由单条 SELECT 完成，以上字段始终来自同一个已提交时刻；导出之后源库新追加的分片**不在**
+检查点内，需在目标库按 `next_offset` 重新提交。
+
+导入规则（任一不满足即整次失败，目标库现有状态不被覆盖）：
+
+- 目标库必须**已注册该确切协议版本且定义摘要相同**：版本未注册返回 404
+  `PROTOCOL_NOT_FOUND`；同 ID+版本但定义不同返回 409 `SESSION_CHECKPOINT_CONFLICT`
+  （`details.reason = "protocol_mismatch"`，附双方摘要）；
+- 目标库已存在同名会话（含重复导入同一检查点）返回 409 `SESSION_CHECKPOINT_CONFLICT`
+  （`details.reason = "session_exists"`）；
+- 检查点自身须自洽——待决尾部不越过流起点、最近分片三元组（偏移/摘要/原响应）齐全且
+  原响应的 `received_offset`/`next_offset`/尾部/累计帧数与检查点一致、稽核位宽与计数同
+  固定协议及原响应中的稽核块一致——违反任一项返回 422 `SESSION_CHECKPOINT_INVALID`
+  （`details.check` 指明失败的检查项）；
+- 校验全部通过后，整个检查点作为**一条 INSERT** 落库：要么完整出现，要么完全不存在，
+  并发导入同一检查点时恰有一个成功、其余 409 且不覆盖。
+
+导入成功后：跨分片解码（待决尾部自动拼接到下一片前）与序号稽核从导入状态继续；把最近
+分片按原偏移与内容重发仍返回**原响应**（`replayed: true`）且不重复计数；超出 SQLite 有符号
+整数范围的稽核值在检查点 JSON 中是精确的十进制整数，导入方不得按浮点解析。
+
+下面把 4.2 的会话从源库（实例 8000，`/tmp/resync-a.db`）迁移到目标库（实例 8001，
+`/tmp/resync-b.db`）。本地起两个使用不同数据库文件的实例（容器部署时对应两个命名卷；
+`docker compose up --build` 的单实例启动方式不变）：
+
+```bash
+RESYNC_DB_PATH=/tmp/resync-a.db uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+RESYNC_DB_PATH=/tmp/resync-b.db uvicorn app.main:app --host 0.0.0.0 --port 8001 &
+```
+
+**第 1 步：目标库注册同一协议版本。** 定义摘要必须与源库一致（同一 JSON 定义即同一摘要）：
+
+```bash
+curl -s -X POST localhost:8001/protocols -H 'Content-Type: application/json' -d '{
+  "protocol_id": "sensor-line", "version": 1, "sync": [170, 85], "endian": "big",
+  "length_field": {"offset": 4, "size": 1},
+  "crc": {"preset": "CRC-16/CCITT-FALSE", "offset": 6},
+  "fields": [
+    {"name": "seq",  "type": "u8",  "offset": 0},
+    {"name": "addr", "type": "u8",  "offset": 1},
+    {"name": "temp", "type": "s16", "offset": 2, "scale": "0.01"}
+  ],
+  "sequence_field": "seq", "max_frame_length": 64
+}'
+# -> 201 {"definition_sha256": "3abbb05a5723fead…", ...}（与源库相同）
+```
+
+**第 2 步：源库导出检查点。** 假设 4.2 的第 1 片（17 字节）已提交，帧 2 的前 4 字节在
+待决尾部：
+
+```bash
+curl -s localhost:8000/sessions/00e49c0d66904047837921d05a3090d6/checkpoint > checkpoint.json
+```
+
+```json
+{
+  "checkpoint_version": 1,
+  "session_id": "00e49c0d66904047837921d05a3090d6",
+  "protocol_id": "sensor-line",
+  "version": 1,
+  "definition_sha256": "3abbb05a5723fead459fedefb0a6229f9cc1a95a48846a5268859bbaaf55b2ac",
+  "received_offset": 17,
+  "tail_b64": "qlUCAw==",
+  "frames_total": 1,
+  "last_chunk_offset": 0,
+  "last_chunk_sha256": "cee651ad439ff50c9f93dc5a4c5d2c935e7870e4b53447d88e2e60a508ad6338",
+  "last_response": {
+    "received_offset": 0,
+    "next_offset": 17,
+    "frames": [ {"start": 2, "end": 13, "sequence": 1, "crc_ok": true, "fields": [ ... ]} ],
+    "discarded": [ {"start": 0, "end": 2, "reason": "noise", "failed_attempts": []} ],
+    "tail": {"start": 13, "end": 17, "payload_b64": "qlUCAw=="},
+    "frame_count": 1,
+    "frames_total": 1,
+    "replayed": false,
+    "sequence_audit": null
+  },
+  "sequence_audit": null
+}
+```
+
+**第 3 步：目标库导入。** 响应与 `GET /sessions/{id}` 相同，即导入后的会话进度：
+
+```bash
+curl -s -X POST localhost:8001/sessions/checkpoint -H 'Content-Type: application/json' \
+  -d @checkpoint.json
+```
+
+```json
+{
+  "session_id": "00e49c0d66904047837921d05a3090d6",
+  "protocol_id": "sensor-line",
+  "version": 1,
+  "received_offset": 17,
+  "next_offset": 17,
+  "tail": {"start": 13, "end": 17, "payload_b64": "qlUCAw=="},
+  "frames_total": 1,
+  "last_chunk_offset": 0,
+  "last_chunk_sha256": "cee651ad439ff50c9f93dc5a4c5d2c935e7870e4b53447d88e2e60a508ad6338",
+  "created_at": "2026-10-07 02:26:03",
+  "updated_at": "2026-10-07 02:26:03",
+  "sequence_audit": null
+}
+```
+
+**第 4 步：目标库续采。** 最近分片重发返回原响应（不重复计数）；追加分片时导入的待决
+尾部自动拼到新分片前，被拆开的帧 2 在累计偏移 `[13, 24)` 处补齐且只产出一次：
+
+```bash
+# 重发第 1 片 -> 200，响应与源库当时完全一致，但 "replayed": true，frames_total 仍为 1
+curl -s -X POST localhost:8001/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "00e49c0d66904047837921d05a3090d6",
+  "expected_offset": 0,
+  "chunk_b64": "EjSqVQEDCSkJAHWbAKpVAgM="
+}'
+
+# 追加第 2 片（帧 2 剩余 7 字节）-> 帧 2 在 [13, 24) 确认，frames_total 变为 2
+curl -s -X POST localhost:8001/sessions/append -H 'Content-Type: application/json' -d '{
+  "session_id": "00e49c0d66904047837921d05a3090d6",
+  "expected_offset": 17,
+  "chunk_b64": "/2oJAKqKAA=="
+}'
+```
+
+失败示例：重复导入同一检查点（目标库已有同名会话）：
+
+```bash
+curl -s -X POST localhost:8001/sessions/checkpoint -H 'Content-Type: application/json' \
+  -d @checkpoint.json
+# -> 409 {"error": {"code": "SESSION_CHECKPOINT_CONFLICT",
+#        "details": {"reason": "session_exists", "session_id": "00e49c0d…"}}, ...}
+```
+
+目标库的同 ID+版本协议定义不同（例如另一套字段布局）时导入被拒绝，且不覆盖目标库状态：
+
+```json
+{"error": {"code": "SESSION_CHECKPOINT_CONFLICT",
+           "message": "protocol 'sensor-line' version 1 is registered with a different definition in this database",
+           "details": {"reason": "protocol_mismatch", "protocol_id": "sensor-line", "version": 1,
+                       "registered_sha256": "…", "checkpoint_sha256": "3abbb05a…"}}}
+```
+
+启用序号稽核的会话同样整体迁移：`sequence_audit` 区块（含超过 2⁶³ 的 `last_sequence` /
+`missing_total`）按精确十进制整数出现在检查点中，导入后稽核从导入基准继续判定（对应
+`tests/test_session_checkpoint.py`）。
+
 ## 协议声明字段
 
 | 字段 | 说明 |
@@ -786,6 +947,8 @@ curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/jso
 | 404 | `SESSION_NOT_FOUND` | 会话 ID 不存在（追加或进度查询） |
 | 409 | `SESSION_APPEND_CONFLICT` | 会话追加：同偏移不同内容（`reason=content_mismatch`）或乱序/跳跃/并发提交（`reason=offset_mismatch`），状态不变 |
 | 422 | `SEQUENCE_AUDIT_UNSUPPORTED` | 创建会话时启用了序号稽核，但协议未声明有效位宽 ≥2 的无符号整数序号字段 |
+| 422 | `SESSION_CHECKPOINT_INVALID` | 导入的会话检查点未通过自洽检查（`details.check` 指明失败项：检查点版本、待决尾部、最近分片三元组、原响应或稽核状态不一致） |
+| 409 | `SESSION_CHECKPOINT_CONFLICT` | 导入会话检查点：目标库已存在同名会话（`reason=session_exists`）或同 ID+版本协议定义摘要不同（`reason=protocol_mismatch`）；均不覆盖现有状态 |
 | 413 | `PAYLOAD_TOO_LARGE` | 超 `RESYNC_MAX_DECODE_BYTES`（会话中指 待决尾部 + 新分片 的拼合大小） |
 
 ## API 一览
@@ -801,6 +964,8 @@ curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/jso
 | `POST` | `/sessions` | 创建分批采集会话（固定协议的确切版本；可选 `sequence_audit` 启用序号稽核） |
 | `POST` | `/sessions/append` | 追加非空 base64 分片（尾部自动拼接，仅返回本次新结果与本次稽核异常） |
 | `GET` | `/sessions/{id}` | 查询会话进度（偏移/待决尾部/累计帧数/最近一次分片/稽核累计） |
+| `GET` | `/sessions/{id}/checkpoint` | 导出会话检查点（同一已提交时刻的完整会话状态，可迁移到另一数据库） |
+| `POST` | `/sessions/checkpoint` | 导入会话检查点（要求目标库已注册相同定义摘要的确切协议版本；自洽校验通过后一次落库，冲突/无效整体失败且不覆盖现有状态） |
 
 同 ID + 版本重复提交**完全相同**的定义是幂等的（返回 `replaced=true`）；定义不同则 409。
 
@@ -814,9 +979,10 @@ app/
   decoder.py   # 候选扫描、反转义、长度/CRC 校验、重同步与歧义判定
   encoder.py   # 字段写入（位域/定点反算/冲突检测）、长度与 CRC 派生、转义、回读校验
   audit.py     # 会话序号连续性稽核（取模比较、异常分类、基准推进）
+  checkpoint.py # 会话检查点：导出组装（同一已提交时刻）与导入自洽校验
   db.py        # SQLite：协议表 + (协议版本, 输入摘要) 结果缓存 + 采集会话状态表（含稽核列）
   errors.py    # 结构化错误类型
-  main.py      # FastAPI 路由与错误处理（/decode、/encode、/sessions[/append]）
+  main.py      # FastAPI 路由与错误处理（/decode、/encode、/sessions[/append|/checkpoint]）
 tests/         # pytest 用例（含构造 CRC 碰撞的歧义用例、编码回读校验、会话跨分片/重试/重启、序号稽核）
 Dockerfile
 docker-compose.yml
@@ -860,3 +1026,9 @@ dangling 转义符）只产出一次且偏移为累计位置、最近分片同�
 恰好半圈（2⁶³）判 `indeterminate`、宽值重试重放不重复计数、409/413 不推进宽基准、重启与多实例
 共用数据库后从持久化宽基准续判、宽审计列仍为 INTEGER 的旧库就地重建为 TEXT 后历史值不变且可
 继续写入超大序号，以及未启用稽核会话与无状态 `/decode` 对同样宽序号的行为保持不变。
+`tests/test_session_checkpoint.py` 覆盖会话检查点导出/导入：导出捕获同一已提交时刻的完整状态
+（协议版本与定义摘要、偏移、原始尾部、累计帧数、最近分片与原响应、稽核进度）；导入只接受目标库
+已注册且定义摘要相同的确切协议版本（未注册 404、定义不同 409 `protocol_mismatch`）；尾部/偏移/
+最近响应/稽核块的各类不自洽均 422 且不产生会话；同名会话冲突 409 且不覆盖已有状态；导入后跨
+分片解码与稽核从导入状态接续、最近分片重发重放原响应不重复计数、超出有符号 64 位的稽核值在
+导出 JSON 与导入落库中逐位精确；并发导入同一检查点恰有一个成功；导出→导入→再导出内容不变。

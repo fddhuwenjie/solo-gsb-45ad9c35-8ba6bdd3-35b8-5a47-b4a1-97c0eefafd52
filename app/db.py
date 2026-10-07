@@ -273,6 +273,16 @@ def _decode_wide(value: Any) -> int | None:
     return None if value is None else int(value)
 
 
+def _session_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    session = dict(row)
+    # Wide audit values persist as decimal text; hand callers plain
+    # Python ints so comparisons and JSON responses stay exact at any
+    # magnitude (see _WIDE_AUDIT_COLUMNS).
+    session["audit_last_sequence"] = _decode_wide(session["audit_last_sequence"])
+    session["audit_missing_total"] = _decode_wide(session["audit_missing_total"])
+    return session
+
+
 class Database:
     def __init__(self, db_path: str) -> None:
         init_db(db_path)
@@ -378,13 +388,90 @@ class Database:
         row = cur.fetchone()
         if row is None:
             return None
-        session = dict(row)
-        # Wide audit values persist as decimal text; hand callers plain
-        # Python ints so comparisons and JSON responses stay exact at any
-        # magnitude (see _WIDE_AUDIT_COLUMNS).
-        session["audit_last_sequence"] = _decode_wide(session["audit_last_sequence"])
-        session["audit_missing_total"] = _decode_wide(session["audit_missing_total"])
-        return session
+        return _session_row_to_dict(row)
+
+    def get_session_checkpoint(self, session_id: str) -> dict[str, Any] | None:
+        """Read one session row together with its protocol definition digest.
+
+        A single SELECT is atomic in SQLite, so every value in the returned
+        row — offset, tail, frame count, last chunk, stored response, audit
+        state and the digest — comes from the same committed moment even
+        while other instances keep appending to this database.
+        """
+        cur = self.conn.execute(
+            "SELECT s.*, p.definition_sha256 AS definition_sha256 "
+            "FROM sessions s JOIN protocols p "
+            "  ON p.protocol_id = s.protocol_id AND p.version = s.version "
+            "WHERE s.session_id = ?",
+            (session_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return _session_row_to_dict(row)
+
+    def insert_session_checkpoint(
+        self,
+        session_id: str,
+        protocol_id: str,
+        version: int,
+        *,
+        received_offset: int,
+        tail_b64: str,
+        frames_total: int,
+        last_chunk_offset: int | None,
+        last_chunk_sha256: str | None,
+        last_response_json: str,
+        audit_enabled: bool,
+        audit_bit_width: int | None,
+        audit_last_sequence: int | None,
+        audit_duplicates: int,
+        audit_suspected_gaps: int,
+        audit_backwards: int,
+        audit_indeterminates: int,
+        audit_missing_total: int,
+    ) -> bool:
+        """Commit one validated checkpoint as a new session row.
+
+        The whole checkpoint lands as a single INSERT, so it either appears
+        complete or not at all — a failed import never leaves partial state
+        behind. Returns False when the session_id already exists: the primary
+        key refuses the insert and the existing row is left untouched, which
+        also settles races between concurrent imports of the same checkpoint.
+        """
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO sessions "
+                    "(session_id, protocol_id, version, received_offset, tail_b64, "
+                    " frames_total, last_chunk_offset, last_chunk_sha256, last_response, "
+                    " audit_enabled, audit_bit_width, audit_last_sequence, "
+                    " audit_duplicates, audit_suspected_gaps, audit_backwards, "
+                    " audit_indeterminates, audit_missing_total) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        protocol_id,
+                        version,
+                        received_offset,
+                        tail_b64,
+                        frames_total,
+                        last_chunk_offset,
+                        last_chunk_sha256,
+                        last_response_json,
+                        int(audit_enabled),
+                        audit_bit_width,
+                        _encode_wide(audit_last_sequence),
+                        audit_duplicates,
+                        audit_suspected_gaps,
+                        audit_backwards,
+                        audit_indeterminates,
+                        _encode_wide(audit_missing_total),
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            return False
+        return True
 
     def save_session_append(
         self,

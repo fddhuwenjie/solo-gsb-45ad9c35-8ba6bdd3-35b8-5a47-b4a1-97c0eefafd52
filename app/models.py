@@ -462,3 +462,47 @@ class SessionProgressResponse(BaseModel):
         description="Cumulative sequence audit state; null unless the session "
         "was created with sequence_audit enabled",
     )
+
+
+class SessionCheckpoint(BaseModel):
+    """Portable snapshot of one collection session at a committed moment.
+
+    Exported from the source database (``GET /sessions/{id}/checkpoint``) and
+    imported into another database (``POST /sessions/checkpoint``) so the
+    session keeps its ``session_id`` and resumes collection there. The
+    pinned protocol version must already be registered in the target
+    database with the identical definition digest.
+    """
+
+    checkpoint_version: int = Field(
+        ..., description="Checkpoint format version; currently 1"
+    )
+    session_id: str
+    protocol_id: str
+    version: int = Field(..., ge=1, description="Exact pinned protocol version")
+    definition_sha256: str = Field(
+        ..., description="SHA-256 digest of the pinned protocol definition"
+    )
+    received_offset: int = Field(
+        ..., ge=0, description="Total raw bytes durably accepted at export time"
+    )
+    tail_b64: str = Field(
+        ..., description="Raw pending tail bytes (base64); empty string when none"
+    )
+    frames_total: int = Field(..., ge=0)
+    last_chunk_offset: int | None = Field(
+        None, ge=0, description="Offset of the most recent committed chunk"
+    )
+    last_chunk_sha256: str | None = Field(
+        None, description="SHA-256 of the most recent committed chunk"
+    )
+    last_response: SessionAppendResponse | None = Field(
+        None,
+        description="Original response of the most recent committed chunk; "
+        "replayed verbatim when that chunk is resent after the import",
+    )
+    sequence_audit: SequenceAuditState | None = Field(
+        None,
+        description="Cumulative sequence audit state; null unless the session "
+        "was created with sequence_audit enabled",
+    )
